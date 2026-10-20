@@ -74,6 +74,8 @@ export class JavaScriptAnalysisWorker {
   #protocolFailure: string | undefined;
   #phase = "startup";
   #lastFailure: AnalysisError | undefined;
+  #activeDeadline: ProviderStartupDeadline | undefined;
+  #observedFailedExit = false;
   #estimatedRetainedBytes = 0;
   #applicationProjectionFailure: AnalysisResourceConstraintError | undefined;
   #parentCapacityExhausted = false;
@@ -119,6 +121,14 @@ export class JavaScriptAnalysisWorker {
       supervisorOptions: {
         captureStdout: false,
         maxDiagnosticBytes: 256 * 1024,
+        onDiagnostic: (event) => {
+          if (
+            event.type === "exit" &&
+            (event.code !== 0 || event.signal !== null) &&
+            this.#activeDeadline?.interruption === undefined
+          )
+            this.#observedFailedExit = true;
+        },
       },
     });
     if (
@@ -187,6 +197,7 @@ export class JavaScriptAnalysisWorker {
       await prepareProcessOwnershipInspection(signal);
       await OwnedWorkerRuntime.retryPending();
       deadline = new ProviderStartupDeadline(this.limits.timeoutMs, signal);
+      this.#activeDeadline = deadline;
       await this.#start(deadline);
       const rootPath = this.#runtime.rootPath;
       const supervisor = this.#runtime.supervisor;
@@ -405,6 +416,8 @@ export class JavaScriptAnalysisWorker {
       result = err({ error: cleanup ?? error, javascript, module, projection });
     } finally {
       deadline?.dispose();
+      this.#activeDeadline = undefined;
+      this.#observedFailedExit = false;
     }
     if (result.ok) this.#lastFailure = undefined;
     else if (!(result.error.error instanceof ProviderCleanupError))
@@ -514,6 +527,17 @@ export class JavaScriptAnalysisWorker {
     path: string,
   ): Promise<JavaScriptWorkerMessage> {
     for (;;) {
+      if (this.#observedFailedExit && this.#frames.length === 0) {
+        const supervisor = this.#runtime.supervisor;
+        // Exit is observed independently of final stderr closure. Attempt to
+        // drain output before classification, even after later cancellation.
+        if (supervisor !== undefined && !supervisor.outputClosed) {
+          await supervisor.waitForOutputClose(10);
+          if (!supervisor.outputClosed && deadline.interruption === undefined)
+            continue;
+        }
+        throw this.#observedExitFailure(path);
+      }
       if (deadline.interruption === "cancelled")
         throw new AnalysisCancelledError(OPERATION);
       if (deadline.interruption === "timeout")
@@ -538,31 +562,37 @@ export class JavaScriptAnalysisWorker {
         // Exit is not complete output: let any final control frame drain first.
         if (!(await supervisor?.waitForOutputClose(10))) continue;
         if (this.#frames.length !== 0) continue;
-        const drained = supervisor?.snapshot() ?? snapshot;
-        throw this.#memoryLimitReached()
-          ? this.#memoryFailure(path)
-          : /heap out of memory|heap limit|allocation failed/iu.test(
-                drained.stderr.text,
-              )
-            ? new AnalysisResourceConstraintError(
-                OPERATION,
-                "memory",
-                `Owned JavaScript worker exhausted its heap while analyzing ${path} during ${this.#phase}`,
-                this.#limits(),
-                { capturedOutput: this.#captured() },
-              )
-            : new ProviderAdapterError(PROVIDER, OPERATION, {
-                capturedOutput: this.#captured(),
-                diagnostics: {
-                  source_path: path,
-                  phase: this.#phase,
-                  exit_code: drained.exitCode ?? null,
-                  signal: drained.signal ?? null,
-                },
-              });
+        throw this.#observedExitFailure(path);
       }
       await waitForAbortableDelay(10, deadline.signal);
     }
+  }
+
+  /** Interpret the owned child exit using the latest bounded output. */
+  #observedExitFailure(path: string): AnalysisError {
+    const snapshot = this.#runtime.supervisor?.snapshot();
+    if (this.#memoryLimitReached()) return this.#memoryFailure(path);
+    if (
+      /heap out of memory|heap limit|allocation failed/iu.test(
+        snapshot?.stderr.text ?? "",
+      )
+    )
+      return new AnalysisResourceConstraintError(
+        OPERATION,
+        "memory",
+        `Owned JavaScript worker exhausted its heap while analyzing ${path} during ${this.#phase}`,
+        this.#limits(),
+        { capturedOutput: this.#captured() },
+      );
+    return new ProviderAdapterError(PROVIDER, OPERATION, {
+      capturedOutput: this.#captured(),
+      diagnostics: {
+        source_path: path,
+        phase: this.#phase,
+        exit_code: snapshot?.exitCode ?? null,
+        signal: snapshot?.signal ?? null,
+      },
+    });
   }
 
   async #readCheckpoint(
@@ -719,6 +749,15 @@ export class JavaScriptAnalysisWorker {
       );
       cause.bindCleanupFailure(error);
       return error;
+    }
+    // An observed failing exit predating interruption is the primary error.
+    if (this.#observedFailedExit) {
+      const failure = this.#observedExitFailure(path);
+      if (deadline?.interruption === "cancelled")
+        failure.retainSecondaryFailure(
+          new AnalysisCancelledError(OPERATION, { cause: signal?.reason }),
+        );
+      return failure;
     }
     // Ownership preparation is abortable before the worker deadline exists.
     if (
