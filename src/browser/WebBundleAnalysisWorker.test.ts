@@ -68,6 +68,8 @@ type TestMode =
       readonly oomMarker?: string;
     }
   | { readonly kind: "delayed-ready" }
+  | { readonly kind: "exit-seven"; readonly stderr: string }
+  | { readonly kind: "authored-frame"; readonly failure: "malformed" | "failure" }
   | {
       readonly kind: "protocol";
       readonly failure: "wrong-id" | "oversized-control" | "oversized-result";
@@ -93,7 +95,44 @@ const protocolWorkerProgram = (
   });
 `;
 
-const delayedReadyProgram = `
+const exitSevenWorkerProgram = (stderr: string): string => {
+  // Never put 300 KiB into the spawned process's command-line argument.
+  const authoredStderr =
+    stderr.length > 64 * 1024 ? '"x".repeat(300 * 1024)' : JSON.stringify(stderr);
+  return \`
+  import { createInterface } from "node:readline";
+  import { getHeapStatistics } from "node:v8";
+  process.stdout.write(JSON.stringify({
+    kind: "ready",
+    heap_limit_bytes: getHeapStatistics().heap_size_limit,
+  }) + "\\n");
+  createInterface({ input: process.stdin, crlfDelay: Infinity }).once("line", () => {
+    process.stderr.write(\${authoredStderr}, () => process.exit(7));
+  });
+\`;
+};
+
+const authoredFrameWorkerProgram = (failure: "malformed" | "failure"): string => \`
+  import { createInterface } from "node:readline";
+  import { getHeapStatistics } from "node:v8";
+  const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+  send({ kind: "ready", heap_limit_bytes: getHeapStatistics().heap_size_limit });
+  createInterface({ input: process.stdin, crlfDelay: Infinity }).once("line", (line) => {
+    const request = JSON.parse(line);
+    if (\${JSON.stringify(failure)} === "malformed") {
+      process.stdout.write("not-json\\n");
+    } else {
+      send({
+        kind: "failure",
+        id: request.id,
+        reason: "output",
+        message: "authored analyzer failure",
+      });
+    }
+  });
+\`;
+
+const delayedReadyProgram = \`
   import { createInterface } from "node:readline";
   import { getHeapStatistics } from "node:v8";
   setTimeout(() => {
@@ -122,7 +161,11 @@ const launcherFor = (
         ? sourceWorkerProgram(mode.hangMarker, mode.oomMarker)
         : mode.kind === "delayed-ready"
           ? delayedReadyProgram
-          : protocolWorkerProgram(mode.failure);
+          : mode.kind === "exit-seven"
+            ? exitSevenWorkerProgram(mode.stderr)
+            : mode.kind === "authored-frame"
+              ? authoredFrameWorkerProgram(mode.failure)
+              : protocolWorkerProgram(mode.failure);
     const spawned = await spawnOwnedProviderProcess({
       ...request,
       arguments: [
@@ -175,6 +218,120 @@ const waitForExit = async (child: ProviderProcessHandle): Promise<void> => {
     if (child.exitCode !== null || child.signalCode !== null) finish();
   });
 };
+
+it.each([
+  ["exit without abort", "controlled inert peer exited 7", false, false],
+  ["late abort", "controlled inert peer exited 7", true, false],
+  ["authored OOM marker", "heap out of memory (text marker only)", true, false],
+  ["truncated stderr", "x".repeat(300 * 1024), true, true],
+] as const)(
+  "preserves observed exit 7 diagnostics: %s",
+  async (_case, stderr, abortAfterExit, truncated) => {
+    const controller = new AbortController();
+    const reason = { source: "after-supervisor-exit" };
+    let observedExit = false;
+    const worker = new WebBundleAnalysisWorker(
+      128,
+      launcherFor(
+        { kind: "exit-seven", stderr },
+        {
+          onSpawn: ({ process: child }) => {
+            child.once("exit", () => {
+              observedExit = true;
+              if (abortAfterExit)
+                queueMicrotask(() => controller.abort(reason));
+            });
+          },
+        },
+      ),
+    );
+    try {
+      const result = await worker.analyze(
+        makeScript("fetch('/not-executed');"),
+        15_000,
+        controller.signal,
+      );
+      const error = failureOf(result);
+      expect(observedExit).toBe(true);
+      expect(error).toBeInstanceOf(
+        stderr.startsWith("heap out of memory")
+          ? AnalysisResourceConstraintError
+          : AnalysisOutputError,
+      );
+      expect(error.capturedOutput).toMatchObject({
+        exit_code: 7,
+        stderr: stderr.slice(0, 256 * 1024),
+        truncated,
+      });
+      expect(controller.signal.aborted).toBe(abortAfterExit);
+      if (abortAfterExit)
+        expect(
+          error.secondaryFailures.some(
+            (secondary) =>
+              secondary instanceof AnalysisCancelledError &&
+              secondary.cause === reason,
+          ),
+        ).toBe(true);
+    } finally {
+      await worker.close();
+      await WebBundleAnalysisWorker.retryPending();
+    }
+  },
+);
+
+it.each(["malformed", "failure"] as const)(
+  "preserves observed %s control failure over later cancellation",
+  async (failure) => {
+    const controller = new AbortController();
+    const reason = { source: "after-control-failure" };
+    let observedOutput = false;
+    const worker = new WebBundleAnalysisWorker(
+      128,
+      launcherFor(
+        { kind: "authored-frame", failure },
+        {
+          onSpawn: ({ process: child }) => {
+            child.stdout?.on("data", (chunk: Buffer | string) => {
+              const value = String(chunk);
+              if (
+                (failure === "malformed" && value.includes("not-json")) ||
+                (failure === "failure" && value.includes('"kind":"failure"'))
+              ) {
+                observedOutput = true;
+                queueMicrotask(() => controller.abort(reason));
+              }
+            });
+          },
+        },
+      ),
+    );
+    try {
+      const result = await worker.analyze(
+        makeScript("fetch('/not-executed');"),
+        15_000,
+        controller.signal,
+      );
+      const error = failureOf(result);
+      expect(observedOutput).toBe(true);
+      expect(error).toBeInstanceOf(AnalysisOutputError);
+      expect(error.message).toContain(
+        failure === "malformed"
+          ? "Invalid web analyzer control frame"
+          : "authored analyzer failure",
+      );
+      expect(
+        error.secondaryFailures.some(
+          (secondary) =>
+            secondary instanceof AnalysisCancelledError &&
+            secondary.cause === reason,
+        ),
+      ).toBe(true);
+    } finally {
+      await worker.close();
+      await WebBundleAnalysisWorker.retryPending();
+    }
+  },
+);
 
 it("reuses one real owned worker for completed facts from consecutive scripts", async () => {
   const children: ProviderProcessHandle[] = [];
