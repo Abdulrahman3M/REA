@@ -90,6 +90,67 @@ it("reuses one real owned analyzer while retaining distinct source identities an
   }
 });
 
+
+it.each([false, true])(
+  "preserves a failed JavaScript worker exit observed before late cancellation (abort: %s)",
+  async (lateAbort) => {
+    const controller = new AbortController();
+    const reason = { origin: "javascript-analysis-exit-7" };
+    const message = "controlled JavaScript worker exited 7";
+    let observedExit = false;
+    const worker = new JavaScriptAnalysisWorker(
+      { heapMb: 128, timeoutMs: 30_000 },
+      async (request) => {
+        const peer = [
+          'const { getHeapStatistics } = require("node:v8");',
+          'const { createInterface } = require("node:readline");',
+          'process.stdout.write(JSON.stringify({ kind: "ready", heap_limit_bytes: getHeapStatistics().heap_size_limit }) + "\\n");',
+          'createInterface({ input: process.stdin }).once("line", () => {',
+          'process.stderr.write("controlled JavaScript worker exited 7", () => process.exit(7));',
+          '});',
+        ].join("\n");
+        const spawned = await spawnOwnedProviderProcess({
+          ...request,
+          arguments: ["-e", peer],
+        });
+        spawned.process.once("exit", () => {
+          observedExit = true;
+          if (lateAbort) queueMicrotask(() => controller.abort(reason));
+        });
+        return spawned;
+      },
+    );
+    try {
+      const result = await worker.analyze(
+        source("exit-seven.js", "export const marker = 7;"),
+        { nodes: 100, unknowns: 100 },
+        controller.signal,
+      );
+      if (result.ok) throw new Error("Expected an observed worker failure");
+      const failure = result.error.error;
+      expect(observedExit).toBe(true);
+      expect(failure._tag).toBe("ProviderAdapterError");
+      expect(failure.diagnostics).toMatchObject({ exit_code: 7 });
+      expect(failure.capturedOutput).toMatchObject({
+        exit_code: 7,
+        stderr: message,
+      });
+      if (lateAbort) {
+        expect(controller.signal.aborted).toBe(true);
+        expect(
+          failure.secondaryFailures.some(
+            (secondary) =>
+              secondary._tag === "AnalysisCancelledError" &&
+              secondary.cause === reason,
+          ),
+        ).toBe(true);
+      }
+    } finally {
+      await worker.close();
+    }
+  },
+);
+
 it("reports an actual startup deadline and closes its owned resources before subsequent analysis", async () => {
   const file = source("app.mjs", "export const observed = 7;");
   const expired = new JavaScriptAnalysisWorker({ heapMb: 128, timeoutMs: 1 });
