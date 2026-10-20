@@ -539,7 +539,9 @@ export class JavaScriptAnalysisWorker {
         throw this.#observedExitFailure(path);
       }
       if (deadline.interruption === "cancelled")
-        throw new AnalysisCancelledError(OPERATION);
+        throw new AnalysisCancelledError(OPERATION, {
+          cause: deadline.signal.reason,
+        });
       if (deadline.interruption === "timeout")
         throw new AnalysisTimeoutError(OPERATION, this.limits.timeoutMs);
       const inputFailure = this.#runtime.inputFailure;
@@ -768,6 +770,7 @@ export class JavaScriptAnalysisWorker {
         !(cause instanceof OwnedWorkerRuntimeCleanupError))
     )
       return new AnalysisCancelledError(OPERATION, {
+        cause: signal?.aborted ? signal.reason : deadline?.signal.reason,
         capturedOutput: this.#captured(),
       });
     if (deadline?.interruption === "timeout")
