@@ -99,7 +99,7 @@ const exitSevenWorkerProgram = (stderr: string): string => {
   // Never put 300 KiB into the spawned process's command-line argument.
   const authoredStderr =
     stderr.length > 64 * 1024 ? '"x".repeat(300 * 1024)' : JSON.stringify(stderr);
-  return \`
+  return `
   import { createInterface } from "node:readline";
   import { getHeapStatistics } from "node:v8";
   process.stdout.write(JSON.stringify({
@@ -107,19 +107,19 @@ const exitSevenWorkerProgram = (stderr: string): string => {
     heap_limit_bytes: getHeapStatistics().heap_size_limit,
   }) + "\\n");
   createInterface({ input: process.stdin, crlfDelay: Infinity }).once("line", () => {
-    process.stderr.write(\${authoredStderr}, () => process.exit(7));
+    process.stderr.write(${authoredStderr}, () => process.exit(7));
   });
-\`;
+`;
 };
 
-const authoredFrameWorkerProgram = (failure: "malformed" | "failure"): string => \`
+const authoredFrameWorkerProgram = (failure: "malformed" | "failure"): string => `
   import { createInterface } from "node:readline";
   import { getHeapStatistics } from "node:v8";
   const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
   send({ kind: "ready", heap_limit_bytes: getHeapStatistics().heap_size_limit });
   createInterface({ input: process.stdin, crlfDelay: Infinity }).once("line", (line) => {
     const request = JSON.parse(line);
-    if (\${JSON.stringify(failure)} === "malformed") {
+    if (${JSON.stringify(failure)} === "malformed") {
       process.stdout.write("not-json\\n");
     } else {
       send({
@@ -130,9 +130,9 @@ const authoredFrameWorkerProgram = (failure: "malformed" | "failure"): string =>
       });
     }
   });
-\`;
+`;
 
-const delayedReadyProgram = \`
+const delayedReadyProgram = `
   import { createInterface } from "node:readline";
   import { getHeapStatistics } from "node:v8";
   setTimeout(() => {
